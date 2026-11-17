@@ -10,7 +10,8 @@
 // So for each forecast hour h = 2..24 this program takes the comparables'
 // log-ratios ln(viewers_h / viewers_1) and reads off their kernel-weighted
 // quantiles, weighted by closeness in log(hour-1 viewers) (Gaussian kernel,
-// bandwidth 0.75 in log units) — the median and the spread both adapt to the
+// bandwidth 0.75 in log units, widening while the estimate would rest on
+// fewer than 8 launches) — the median and the spread both adapt to the
 // launch's own scale. Quantile spreads are shrunk 0.9x toward the median.
 // The curves are computed at run time from the case file's own comparables,
 // so the final case's 42 comparables (including the four practice launches)
@@ -59,6 +60,20 @@ const BANDWIDTH = 0.75;
 const SPREAD = 0.9;
 /** Minimum training launches needed for a kernel estimate, else persistence. */
 const MIN_TRAIN = 5;
+/** Minimum effective sample size of a kernel estimate; the bandwidth widens
+ * until the estimate rests on at least this many launches. This matters most
+ * for the final: if GTA VI's hour 1 lands beyond every comparable launch,
+ * a fixed bandwidth would rest the whole forecast on one or two of them. */
+const MIN_EFFECTIVE_N = 8;
+/** Widest the bandwidth may grow while chasing the effective sample size. */
+const MAX_BANDWIDTH = 3.0;
+
+/** Effective sample size of kernel weights: (sum w)^2 / sum w^2. */
+const effectiveN = (weights: number[]): number => {
+  const s1 = weights.reduce((s, w) => s + w, 0);
+  const s2 = weights.reduce((s, w) => s + w * w, 0);
+  return s2 > 0 ? (s1 * s1) / s2 : 0;
+};
 
 interface HourRow {
   hour: number;
@@ -139,13 +154,21 @@ const forecastCase = (c: Case, name: string): { hours: Array<{ hour: number; q: 
 
   const hours = c.forecast.map(({ hour }) => {
     let q: number[];
-    // Kernel-weighted log-ratio quantiles at this hour.
-    const pts: Array<[number, number]> = [];
+    // Kernel-weighted log-ratio quantiles at this hour. The bandwidth starts
+    // at BANDWIDTH and widens while the estimate rests on too few launches,
+    // so an hour-1 count beyond every comparable still gets a stable curve.
+    const ratios: Array<{ r: number; logh1: number }> = [];
     for (const t of train) {
       const vh = t.hours.get(hour);
       if (vh === undefined) continue;
-      const w = Math.exp(-0.5 * ((t.logh1 - x) / BANDWIDTH) ** 2);
-      pts.push([Math.log(vh / (t.hours.get(1) as number)), w]);
+      ratios.push({ r: Math.log(vh / (t.hours.get(1) as number)), logh1: t.logh1 });
+    }
+    let bw = BANDWIDTH;
+    let pts: Array<[number, number]> = [];
+    while (bw <= MAX_BANDWIDTH) {
+      pts = ratios.map(({ r, logh1 }) => [r, Math.exp(-0.5 * ((logh1 - x) / bw) ** 2)] as [number, number]);
+      if (pts.length < MIN_TRAIN || effectiveN(pts.map((p) => p[1])) >= MIN_EFFECTIVE_N) break;
+      bw *= 1.5;
     }
     if (pts.length >= MIN_TRAIN) {
       const med = wquantile(pts, 0.5);
